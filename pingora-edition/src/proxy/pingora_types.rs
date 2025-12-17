@@ -1,62 +1,130 @@
-//! Mock Pingora types and traits for development
-//! This module provides the necessary types and traits that would normally come from Pingora
+//! HTTP/2 server types and extensions
+//! This module provides HTTP/2 server functionality using hyper
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::Bytes;
-use http::{HeaderMap, Method, Uri, Version, HeaderName, HeaderValue};
+use http::{HeaderMap, Method, Uri, Version, HeaderName, HeaderValue, Request};
 use std::net::SocketAddr;
 
-/// Mock Session type representing an HTTP session
-#[derive(Debug)]
+// HTTP types for our proxy
+pub type RequestHeader = http::request::Parts;
+pub type ResponseHeader = http::response::Parts;
+
+/// HTTP session information
 pub struct Session {
     pub client_addr: SocketAddr,
     pub server_addr: SocketAddr,
-    pub method: Method,
-    pub uri: Uri,
-    pub version: Version,
-    pub headers: HeaderMap,
+    pub request_parts: http::request::Parts,
+    pub request_body: Option<hyper::body::Incoming>,
 }
 
 impl Session {
-    pub fn new(client_addr: SocketAddr, server_addr: SocketAddr) -> Self {
+    pub fn new(client_addr: SocketAddr, server_addr: SocketAddr, request: Request<hyper::body::Incoming>) -> Self {
+        let (parts, body) = request.into_parts();
         Self {
             client_addr,
             server_addr,
-            method: Method::GET,
-            uri: Uri::from_static("/"),
-            version: Version::HTTP_2,
-            headers: HeaderMap::new(),
+            request_parts: parts,
+            request_body: Some(body),
         }
     }
 
-    pub fn client_addr(&self) -> SocketAddr {
-        self.client_addr
+    pub fn method(&self) -> &Method {
+        &self.request_parts.method
     }
 
     pub fn uri(&self) -> &Uri {
-        &self.uri
+        &self.request_parts.uri
     }
 
-    pub fn method(&self) -> &Method {
-        &self.method
+    pub fn version(&self) -> Version {
+        self.request_parts.version
     }
 
     pub fn headers(&self) -> &HeaderMap {
-        &self.headers
+        &self.request_parts.headers
+    }
+
+    pub async fn body_bytes(&mut self) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+        use http_body_util::BodyExt;
+        
+        if let Some(body) = self.request_body.take() {
+            // Collect all the body bytes
+            let collected = body.collect().await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+            Ok(collected.to_bytes())
+        } else {
+            // Body already consumed
+            Ok(Bytes::new())
+        }
+    }
+
+    /// Take the streaming body for forwarding (supports bidirectional streaming)
+    pub fn take_body(&mut self) -> Option<hyper::body::Incoming> {
+        self.request_body.take()
     }
 }
 
-/// Mock Context type for request processing
+/// Context for request processing
 #[derive(Debug, Default)]
 pub struct Context {
-    pub route_match: Option<String>,
     pub upstream_address: Option<SocketAddr>,
+    pub route_match: Option<String>,
+    pub tls_terminated: bool,
+    pub client_cert: Option<Vec<u8>>,
     pub trailer_state: Option<TrailerState>,
-    pub client_cert: Option<Vec<u8>>, // Client certificate for mTLS
-    pub tls_terminated: bool, // Whether TLS was terminated for this request
 }
 
-/// Trailer state for managing HTTP trailers
+/// HTTP peer for upstream connections
+#[derive(Debug, Clone)]
+pub struct HttpPeer {
+    pub address: SocketAddr,
+    pub scheme: String,
+}
+
+impl HttpPeer {
+    pub fn new(address: SocketAddr, scheme: &str) -> Self {
+        Self {
+            address,
+            scheme: scheme.to_string(),
+        }
+    }
+}
+
+/// Proxy HTTP trait for handling requests
+#[async_trait::async_trait]
+pub trait ProxyHttp<C> {
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut C,
+    ) -> Result<Box<HttpPeer>, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut C,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut C,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut C,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Custom trailer state for gRPC trailer handling
 #[derive(Debug, Clone)]
 pub struct TrailerState {
     pub headers: HeaderMap,
@@ -75,244 +143,129 @@ impl TrailerState {
         }
     }
 
-    /// Add a header to the trailer state
     pub fn add_header(&mut self, name: &str, value: &str) {
-        if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse::<HeaderValue>()) {
+        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
             self.headers.insert(name, value);
         }
     }
 
-    /// Add a custom trailer (non-gRPC specific)
     pub fn add_custom_trailer(&mut self, name: &str, value: &str) {
-        if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse::<HeaderValue>()) {
+        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
             self.custom_trailers.insert(name, value);
         }
     }
 
-    /// Set gRPC status and message
     pub fn set_grpc_status(&mut self, status: i32, message: Option<String>) {
         self.grpc_status = Some(status);
-        self.grpc_message = message.clone();
+        self.grpc_message = message;
         
-        // Also add to headers for consistency
+        // Add to headers for forwarding
         self.add_header("grpc-status", &status.to_string());
-        if let Some(msg) = &message {
-            self.add_header("grpc-message", msg);
+        if let Some(msg) = &self.grpc_message {
+            let msg_clone = msg.clone();
+            self.add_header("grpc-message", &msg_clone);
         }
     }
 
-    /// Extract trailers from upstream response headers
     pub fn extract_from_headers(&mut self, headers: &HeaderMap) -> Result<()> {
-        for (name, value) in headers.iter() {
-            let name_str = name.as_str().to_lowercase();
-            
-            // Handle gRPC-specific trailers
-            match name_str.as_str() {
-                "grpc-status" => {
-                    if let Ok(status_str) = value.to_str() {
-                        if let Ok(status) = status_str.parse::<i32>() {
-                            self.grpc_status = Some(status);
-                            self.add_header("grpc-status", status_str);
-                        }
-                    }
-                }
-                "grpc-message" => {
-                    if let Ok(message) = value.to_str() {
-                        self.grpc_message = Some(message.to_string());
-                        self.add_header("grpc-message", message);
-                    }
-                }
-                _ => {
-                    // Preserve all other trailers
-                    if let Ok(value_str) = value.to_str() {
-                        self.add_custom_trailer(name.as_str(), value_str);
-                    }
+        // Extract gRPC status
+        if let Some(status_header) = headers.get("grpc-status") {
+            if let Ok(status_str) = status_header.to_str() {
+                if let Ok(status) = status_str.parse::<i32>() {
+                    self.grpc_status = Some(status);
                 }
             }
         }
+
+        // Extract gRPC message
+        if let Some(message_header) = headers.get("grpc-message") {
+            if let Ok(message_str) = message_header.to_str() {
+                self.grpc_message = Some(message_str.to_string());
+            }
+        }
+
+        // Copy all headers that look like trailers
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str();
+            if name_str.starts_with("grpc-") || 
+               name_str.starts_with("x-") ||
+               name_str == "content-type" ||
+               name_str == "content-length" {
+                self.headers.insert(name.clone(), value.clone());
+            }
+        }
+
         Ok(())
     }
 
-    /// Get all trailers as a single HeaderMap
     pub fn get_all_trailers(&self) -> HeaderMap {
         let mut all_trailers = self.headers.clone();
         
+        // Add gRPC status and message if set
+        if let Some(status) = self.grpc_status {
+            if let Ok(value) = HeaderValue::from_str(&status.to_string()) {
+                all_trailers.insert("grpc-status", value);
+            }
+        }
+        
+        if let Some(message) = &self.grpc_message {
+            if let Ok(value) = HeaderValue::from_str(message) {
+                all_trailers.insert("grpc-message", value);
+            }
+        }
+
         // Add custom trailers
         for (name, value) in self.custom_trailers.iter() {
             all_trailers.insert(name.clone(), value.clone());
         }
-        
-        // Ensure gRPC status is always present
-        if self.grpc_status.is_some() && !all_trailers.contains_key("grpc-status") {
-            if let Some(status) = self.grpc_status {
-                if let Ok(value) = status.to_string().parse::<HeaderValue>() {
-                    all_trailers.insert("grpc-status", value);
-                }
-            }
-        }
-        
-        // Ensure gRPC message is present if we have one
-        if self.grpc_message.is_some() && !all_trailers.contains_key("grpc-message") {
-            if let Some(ref message) = self.grpc_message {
-                if let Ok(value) = message.parse::<HeaderValue>() {
-                    all_trailers.insert("grpc-message", value);
-                }
-            }
-        }
-        
+
         all_trailers
     }
 
-    /// Check if trailer state is empty
     pub fn is_empty(&self) -> bool {
         self.headers.is_empty() && 
-        self.custom_trailers.is_empty() && 
-        self.grpc_status.is_none()
+        self.grpc_status.is_none() && 
+        self.grpc_message.is_none() &&
+        self.custom_trailers.is_empty()
     }
 
-    /// Validate that trailers are properly formatted for gRPC
     pub fn validate_grpc_trailers(&self) -> Result<()> {
-        // gRPC requires a status trailer
+        // Ensure we have a gRPC status
         if self.grpc_status.is_none() {
-            return Err(anyhow!("gRPC status trailer is required"));
+            return Err(anyhow::anyhow!("Missing gRPC status in trailers"));
         }
 
-        // Validate status code is in valid range
+        // Validate status code range
         if let Some(status) = self.grpc_status {
             if status < 0 || status > 16 {
-                return Err(anyhow!("Invalid gRPC status code: {}", status));
+                return Err(anyhow::anyhow!("Invalid gRPC status code: {}", status));
             }
         }
 
         // Validate header names and values
-        for (name, value) in self.headers.iter().chain(self.custom_trailers.iter()) {
-            // Header names should be lowercase
-            let name_str = name.as_str();
-            if name_str != name_str.to_lowercase() {
-                return Err(anyhow!("Trailer header names must be lowercase: {}", name_str));
+        for (name, value) in self.headers.iter() {
+            if name.as_str().is_empty() {
+                return Err(anyhow::anyhow!("Empty header name in trailers"));
             }
-
-            // Validate header value is valid ASCII
+            
             if value.to_str().is_err() {
-                return Err(anyhow!("Trailer header values must be valid ASCII: {}", name_str));
+                return Err(anyhow::anyhow!("Invalid header value for {}", name));
             }
         }
 
         Ok(())
     }
 
-    /// Handle trailer parsing errors gracefully
     pub fn handle_parsing_error(&mut self, error: &str) {
-        // Set error status
-        self.set_grpc_status(13, Some(format!("Trailer parsing error: {}", error))); // INTERNAL error
-        
-        // Add error information as custom trailer
-        self.add_custom_trailer("x-proxy-error", error);
+        // Set error status and add debugging information
+        self.set_grpc_status(13, Some(format!("Trailer parsing error: {}", error))); // INTERNAL
+        self.add_custom_trailer("x-proxy-error", "trailer-parsing-failed");
+        self.add_custom_trailer("x-proxy-error-detail", error);
     }
 }
 
-/// Mock RequestHeader type
-#[derive(Debug, Clone)]
-pub struct RequestHeader {
-    pub method: Method,
-    pub uri: Uri,
-    pub version: Version,
-    pub headers: HeaderMap,
-}
-
-impl RequestHeader {
-    pub fn new(method: Method, uri: Uri) -> Self {
-        Self {
-            method,
-            uri,
-            version: Version::HTTP_2,
-            headers: HeaderMap::new(),
-        }
+impl Default for TrailerState {
+    fn default() -> Self {
+        Self::new()
     }
-
-    pub fn insert_header(&mut self, name: &str, value: &str) {
-        if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse::<HeaderValue>()) {
-            self.headers.insert(name, value);
-        }
-    }
-}
-
-/// Mock ResponseHeader type
-#[derive(Debug, Clone)]
-pub struct ResponseHeader {
-    pub status: u16,
-    pub version: Version,
-    pub headers: HeaderMap,
-}
-
-impl ResponseHeader {
-    pub fn new(status: u16) -> Self {
-        Self {
-            status,
-            version: Version::HTTP_2,
-            headers: HeaderMap::new(),
-        }
-    }
-
-    pub fn insert_header(&mut self, name: &str, value: &str) {
-        if let (Ok(name), Ok(value)) = (name.parse::<HeaderName>(), value.parse::<HeaderValue>()) {
-            self.headers.insert(name, value);
-        }
-    }
-
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-}
-
-/// Mock HttpPeer type representing an upstream server
-#[derive(Debug)]
-pub struct HttpPeer {
-    pub address: SocketAddr,
-    pub scheme: String,
-}
-
-impl HttpPeer {
-    pub fn new(address: SocketAddr, scheme: &str) -> Self {
-        Self {
-            address,
-            scheme: scheme.to_string(),
-        }
-    }
-}
-
-/// Mock ProxyHttp trait that services must implement
-#[async_trait::async_trait]
-pub trait ProxyHttp: Send + Sync {
-    /// Select the upstream peer for this request
-    async fn upstream_peer(
-        &self,
-        session: &Session,
-        ctx: &mut Context,
-    ) -> Result<Box<HttpPeer>>;
-
-    /// Filter/modify the upstream request before sending
-    async fn upstream_request_filter(
-        &self,
-        session: &Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut Context,
-    ) -> Result<()>;
-
-    /// Filter/modify the response headers from upstream
-    async fn response_filter(
-        &self,
-        session: &Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut Context,
-    ) -> Result<()>;
-
-    /// Filter/modify the response body and handle trailers
-    async fn upstream_response_body_filter(
-        &self,
-        session: &Session,
-        body: &mut Option<Bytes>,
-        end_of_stream: bool,
-        ctx: &mut Context,
-    ) -> Result<()>;
 }

@@ -176,7 +176,7 @@ async fn main() -> ProxyResult<()> {
     info!("  Default upstream: {}", config.default_upstream.address);
 
     // Create and initialize the proxy server
-    let proxy_server = match ProxyServer::new(config) {
+    let mut proxy_server = match ProxyServer::new(config) {
         Ok(server) => {
             info!("Proxy server initialized successfully");
             server
@@ -212,10 +212,6 @@ async fn main() -> ProxyResult<()> {
             match result {
                 Ok(()) => {
                     info!("Proxy server started successfully");
-                    // In a real implementation, this would block until the server stops
-                    // For now, we'll simulate running until shutdown
-                    setup_shutdown_handler().await;
-                    info!("Shutdown signal received");
                 }
                 Err(e) => {
                     error!("Proxy server failed to start: {}", e);

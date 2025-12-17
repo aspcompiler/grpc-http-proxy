@@ -1,6 +1,6 @@
 # Example configuration for gRPC HTTP Proxy
 server:
-  bind_address: "127.0.0.1:10001"
+  bind_address: "[::]:10001"  # Listen on both IPv4 and IPv6
   worker_threads: 4
   max_connections: 1000
 
@@ -15,6 +15,6 @@ routes:
 
 # Default upstream for unmatched routes
 default_upstream:
-  address: "127.0.0.1:10000"
+  address: "[::1]:10000"
   connection_pool_size: 20
   timeout: "60s"

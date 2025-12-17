@@ -1,22 +1,32 @@
-//! Main proxy server implementation
+//! Main proxy server implementation using hyper HTTP/2
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use tracing::{info, warn};
+use std::net::SocketAddr;
+use tracing::{info, warn, error, debug};
+use tokio::net::TcpListener;
+use hyper::server::conn::http2;
+use hyper::{Request, Response, StatusCode};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use hyper::service::Service;
+use std::future::Future;
+use std::pin::Pin;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 
 use crate::config::ProxyConfig;
 use super::service::GrpcProxyService;
 use super::tls::TlsManager;
+use super::pingora_types::{Session, Context as ProxyContext, ProxyHttp};
 
-// Placeholder types for Pingora integration (will be replaced when Pingora is available)
-struct PingoraServer;
-struct PingoraService;
-struct SslAcceptor;
-
-/// Main proxy server built on Pingora's foundation
+/// Main proxy server built on hyper HTTP/2
 pub struct ProxyServer {
     config: ProxyConfig,
     tls_manager: TlsManager,
+    service: Arc<GrpcProxyService>,
 }
 
 impl ProxyServer {
@@ -38,60 +48,106 @@ impl ProxyServer {
             info!("TLS disabled - server will accept plain HTTP/2 connections");
         }
 
-        Ok(Self { config, tls_manager })
+        // Create the proxy service
+        let service = Arc::new(GrpcProxyService::new(
+            config.clone(),
+            tls_manager.server_config(),
+        ));
+
+        Ok(Self { 
+            config, 
+            tls_manager,
+            service,
+        })
     }
 
     /// Start the proxy server
-    pub async fn start(&self) -> Result<()> {
+    pub async fn start(&mut self) -> Result<()> {
         info!("Starting gRPC HTTP Proxy server");
         info!("Binding to address: {}", self.config.server.bind_address);
-
-        // Create the proxy service with TLS configuration
-        let proxy_service = GrpcProxyService::new(
-            self.config.clone(),
-            self.tls_manager.server_config(),
-        );
 
         // Validate server configuration before starting
         self.validate_server_configuration()?;
 
-        // Configure server based on TLS availability
-        if let Some(tls_config) = self.tls_manager.server_config() {
-            info!("TLS mode: Accepting TLS connections with HTTP/2 (h2) via ALPN");
-            info!("Server certificate loaded and validated");
-            
-            if self.tls_manager.is_mtls_enabled() {
-                info!("mTLS client certificate validation enabled");
-                info!("CA certificate store configured for client verification");
+        // Create TCP listener
+        let listener = TcpListener::bind(&self.config.server.bind_address).await
+            .with_context(|| format!("Failed to bind to {}", self.config.server.bind_address))?;
+
+        info!("Server listening on {}", self.config.server.bind_address);
+        info!("Ready to accept gRPC connections");
+
+        // Accept connections in a loop
+        loop {
+            match listener.accept().await {
+                Ok((stream, client_addr)) => {
+                    let service = self.service.clone();
+                    let server_addr = self.config.server.bind_address;
+                    
+                    debug!("Accepted connection from {}", client_addr);
+                    
+                    // Handle the connection in a separate task
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_connection(stream, client_addr, server_addr, service).await {
+                            error!("Connection error from {}: {}", client_addr, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                    // Continue accepting other connections
+                }
             }
-
-            // Demonstrate TLS integration pattern
-            self.demonstrate_tls_integration(tls_config)?;
-        } else {
-            info!("Plain HTTP/2 mode: Accepting plain HTTP/2 connections");
-            info!("No TLS configuration provided - server will accept unencrypted HTTP/2");
-            
-            // Demonstrate plain HTTP/2 configuration
-            self.demonstrate_plain_http2_configuration()?;
         }
+    }
 
-        // Configure worker threads if specified
-        if let Some(threads) = self.config.server.worker_threads {
-            info!("Configuring {} worker threads", threads);
-        } else {
-            info!("Using default worker thread configuration");
-        }
+    /// Handle a single connection
+    async fn handle_connection(
+        stream: tokio::net::TcpStream,
+        client_addr: SocketAddr,
+        server_addr: SocketAddr,
+        service: Arc<GrpcProxyService>,
+    ) -> Result<()> {
+        debug!("Handling connection from {}", client_addr);
 
-        // Configure connection limits
-        if let Some(max_conn) = self.config.server.max_connections {
-            info!("Maximum connections limit: {}", max_conn);
-        }
+        // Create a hyper service wrapper
+        let hyper_service = HyperServiceWrapper {
+            proxy_service: service,
+            client_addr,
+            server_addr,
+        };
 
-        info!("Server configuration completed successfully");
+        // Use HTTP/2 to serve the connection with gRPC-optimized settings
+        let io = TokioIo::new(stream);
         
-        // Start the actual server
-        self.start_server_with_service(proxy_service).await?;
+        let mut builder = http2::Builder::new(hyper_util::rt::TokioExecutor::new());
         
+        // Configure HTTP/2 settings for gRPC
+        builder
+            .initial_stream_window_size(Some(65536))  // 64KB initial window
+            .initial_connection_window_size(Some(1048576))  // 1MB connection window
+            .max_frame_size(Some(16384))  // 16KB max frame size
+            .max_concurrent_streams(Some(100))  // Allow up to 100 concurrent streams
+            .keep_alive_interval(Some(std::time::Duration::from_secs(30)))  // Keep alive every 30s
+            .keep_alive_timeout(std::time::Duration::from_secs(10))  // 10s keep alive timeout
+            .timer(hyper_util::rt::TokioTimer::new());  // Add timer for hyper
+        
+        if let Err(e) = builder
+            .serve_connection(io, hyper_service)
+            .await
+        {
+            error!("HTTP/2 connection error from {}: {}", client_addr, e);
+        }
+
+        debug!("Connection from {} closed", client_addr);
+        Ok(())
+    }
+
+    /// Stop the proxy server gracefully
+    pub async fn stop(&self) -> Result<()> {
+        info!("Proxy server shutdown requested");
+        // In a real implementation, we would signal the server to stop accepting new connections
+        // and wait for existing connections to finish
+        info!("Proxy server shutdown completed");
         Ok(())
     }
 
@@ -135,134 +191,238 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Start the server with the configured proxy service
-    async fn start_server_with_service(&self, proxy_service: GrpcProxyService) -> Result<()> {
-        info!("Initializing server with proxy service...");
+    /// Get server statistics (if available)
+    pub fn get_stats(&self) -> Result<ServerStats> {
+        Ok(ServerStats {
+            active_connections: 0, // Would be tracked in real implementation
+            total_requests: 0,
+            uptime_seconds: 0,
+        })
+    }
+}
 
-        // Log service configuration
-        if proxy_service.is_tls_enabled() {
-            info!("Proxy service configured with TLS support");
-        } else {
-            info!("Proxy service configured for plain HTTP/2");
-        }
+/// Server statistics structure
+#[derive(Debug, Clone)]
+pub struct ServerStats {
+    pub active_connections: u64,
+    pub total_requests: u64,
+    pub uptime_seconds: u64,
+}
 
-        // In a real Pingora implementation, this would:
-        // 1. Create a Pingora Server instance
-        // 2. Configure it with our proxy service
-        // 3. Set up TLS listeners if TLS is enabled
-        // 4. Set up plain HTTP/2 listeners if TLS is disabled
-        // 5. Start the server and handle connections
+/// Wrapper to adapt our ProxyHttp service to hyper's Service trait
+#[derive(Clone)]
+struct HyperServiceWrapper {
+    proxy_service: Arc<GrpcProxyService>,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+}
 
-        info!("Server initialization completed");
-        info!("Ready to accept connections on {}", self.config.server.bind_address);
+impl Service<Request<Incoming>> for HyperServiceWrapper {
+    type Response = Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-        // Simulate server running
-        // In a real implementation, this would be the main server loop
-        self.simulate_server_operation().await?;
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let service = self.proxy_service.clone();
+        let client_addr = self.client_addr;
+        let server_addr = self.server_addr;
 
-        Ok(())
+        Box::pin(async move {
+            debug!("Processing request: {} {} from {}", req.method(), req.uri(), client_addr);
+
+            // Validate that this is a gRPC request
+            if req.method() != hyper::Method::POST {
+                warn!("Non-POST request from {}: {} {}", client_addr, req.method(), req.uri());
+                return Ok(Self::create_grpc_error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    12, // UNIMPLEMENTED
+                    "Only POST method is supported for gRPC"
+                ));
+            }
+
+            // Check content-type for gRPC
+            let content_type = req.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            
+            if !content_type.starts_with("application/grpc") {
+                warn!("Non-gRPC content-type from {}: {}", client_addr, content_type);
+                return Ok(Self::create_grpc_error_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    3, // INVALID_ARGUMENT
+                    "Content-Type must be application/grpc"
+                ));
+            }
+
+            // Create session and context
+            let mut session = Session::new(client_addr, server_addr, req);
+            let mut ctx = ProxyContext::default();
+
+            // Process the request through our proxy service
+            match Self::process_request(&*service, &mut session, &mut ctx).await {
+                Ok(response) => {
+                    debug!("Request processed successfully for {}", client_addr);
+                    Ok(response)
+                },
+                Err(e) => {
+                    error!("Request processing failed for {}: {}", client_addr, e);
+                    
+                    Ok(Self::create_grpc_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        13, // INTERNAL
+                        "Proxy processing error"
+                    ))
+                }
+            }
+        })
+    }
+}
+
+impl HyperServiceWrapper {
+    fn create_grpc_error_response(status: StatusCode, grpc_status: u32, message: &str) -> Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> {
+        let empty_body = Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed();
+        
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/grpc")
+            .header("grpc-status", grpc_status.to_string())
+            .header("grpc-message", message)
+            .body(empty_body)
+            .unwrap()
+    }
+}
+
+impl HyperServiceWrapper {
+    async fn process_request(
+        service: &GrpcProxyService,
+        session: &mut Session,
+        ctx: &mut ProxyContext,
+    ) -> Result<Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>, Box<dyn std::error::Error + Send + Sync>> {
+        // Step 1: Select upstream peer
+        let _peer = service.upstream_peer(session, ctx).await?;
+        debug!("Selected upstream: {:?}", ctx.upstream_address);
+
+        // Step 2: Create upstream request parts (simplified)
+        let request = Request::builder()
+            .method(session.method())
+            .uri(session.uri())
+            .version(session.version())
+            .body(())
+            .unwrap();
+        let (mut upstream_request, _) = request.into_parts();
+        upstream_request.headers = session.headers().clone();
+        service.upstream_request_filter(session, &mut upstream_request, ctx).await?;
+        debug!("Request filtered for upstream");
+
+        // Step 3: Take streaming body for forwarding (supports bidirectional streaming)
+        let request_body = session.take_body();
+        debug!("Using streaming body for upstream request");
+        
+        // Step 4: Make real upstream request with streaming
+        let upstream_response = Self::make_upstream_request_streaming(&upstream_request, ctx, request_body).await?;
+        
+        // Return the upstream response directly (this supports streaming)
+        info!("Request processed successfully - forwarded to upstream with streaming");
+        Ok(upstream_response)
     }
 
-    /// Simulate server operation (placeholder for actual Pingora integration)
-    async fn simulate_server_operation(&self) -> Result<()> {
-        info!("Server is now running and ready to accept connections");
-        info!("Proxy service is handling gRPC requests");
+    async fn make_upstream_request_streaming(
+        upstream_request: &http::request::Parts,
+        ctx: &ProxyContext,
+        request_body: Option<hyper::body::Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>, Box<dyn std::error::Error + Send + Sync>> {
+        let upstream_addr = ctx.upstream_address
+            .ok_or("No upstream address configured")?;
         
-        // Log operational status
-        if self.tls_manager.is_enabled() {
-            info!("TLS termination active - decrypting incoming connections");
-            if self.tls_manager.is_mtls_enabled() {
-                info!("mTLS validation active - verifying client certificates");
+        debug!("Making streaming upstream request to {:?}", upstream_addr);
+        
+        // Create HTTP/2 client
+        let client = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http();
+        
+        // Build upstream URL with proper IPv6 handling
+        let upstream_url = if upstream_addr.is_ipv6() {
+            format!("http://[{}]:{}{}", 
+                upstream_addr.ip(), 
+                upstream_addr.port(), 
+                upstream_request.uri.path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/")
+            )
+        } else {
+            format!("http://{}:{}{}", 
+                upstream_addr.ip(), 
+                upstream_addr.port(), 
+                upstream_request.uri.path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/")
+            )
+        };
+        
+        // Create upstream request
+        let mut upstream_req_builder = Request::builder()
+            .method(&upstream_request.method)
+            .uri(upstream_url)
+            .version(http::Version::HTTP_2);
+        
+        // Copy headers (excluding host which will be set automatically)
+        for (name, value) in &upstream_request.headers {
+            if name != "host" {
+                upstream_req_builder = upstream_req_builder.header(name, value);
             }
         }
-
-        info!("Routing engine active - {} routes configured", self.config.routes.len());
-        info!("Upstream connections ready - default: {}", self.config.default_upstream.address);
-
-        // In a real implementation, this would be where Pingora runs
-        // For now, we'll just indicate that the server is ready
-        warn!("Server simulation mode - waiting for Pingora integration");
-        warn!("In production, this would be the main server event loop");
-
-        // Keep the server "running" until shutdown
-        // In a real implementation, Pingora would handle this
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        Ok(())
-    }
-
-    /// Stop the proxy server gracefully
-    pub async fn stop(&self) -> Result<()> {
-        // Pingora handles graceful shutdown internally
-        // This method is provided for future extensibility
-        info!("Proxy server shutdown requested");
-        Ok(())
-    }
-
-    /// Demonstrate TLS integration pattern with Pingora
-    fn demonstrate_tls_integration(&self, server_config: Arc<rustls::ServerConfig>) -> Result<()> {
-        info!("Demonstrating TLS integration pattern:");
         
-        // 1. Verify ALPN configuration
-        let alpn_protocols = &server_config.alpn_protocols;
-        if alpn_protocols.len() == 1 && alpn_protocols[0] == b"h2" {
-            info!("✓ ALPN correctly configured for HTTP/2 (h2)");
+        // Use streaming body or empty body - box both to have consistent types
+        let boxed_body: BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>> = if let Some(body) = request_body {
+            body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed()
         } else {
-            warn!("⚠ ALPN configuration may be incorrect: {:?}", alpn_protocols);
-        }
-
-        // 2. Verify certificate chain
-        info!("✓ Server certificate chain loaded and validated");
+            Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed()
+        };
         
-        // 3. Verify mTLS configuration
-        if self.tls_manager.is_mtls_enabled() {
-            if let Some(_ca_store) = self.tls_manager.ca_store() {
-                info!("✓ CA certificate store configured for mTLS");
-                info!("  - Client certificates will be validated against loaded CA");
-            }
-        }
-
-        // 4. Integration points with Pingora:
-        info!("Integration points with Pingora:");
-        info!("  - ServerConfig will be passed to Pingora's TLS listener");
-        info!("  - ALPN negotiation will ensure HTTP/2 protocol");
-        info!("  - mTLS verification will be handled by rustls WebPkiClientVerifier");
-        info!("  - Certificate validation includes expiry and format checks");
-        info!("  - TLS connections will be terminated and forwarded as plain HTTP/2");
-
-        Ok(())
-    }
-
-    /// Demonstrate plain HTTP/2 configuration when TLS is disabled
-    fn demonstrate_plain_http2_configuration(&self) -> Result<()> {
-        info!("Demonstrating plain HTTP/2 configuration:");
+        let upstream_req = upstream_req_builder
+            .body(boxed_body)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        // 1. Verify plain HTTP/2 support
-        info!("✓ Plain HTTP/2 connections enabled");
-        info!("  - Server will accept HTTP/2 connections without TLS");
-        info!("  - No certificate validation required");
-        info!("  - Direct HTTP/2 communication with clients");
-
-        // 2. Integration points with Pingora for plain HTTP/2:
-        info!("Integration points with Pingora for plain HTTP/2:");
-        info!("  - Pingora will be configured to accept plain HTTP/2 connections");
-        info!("  - No TLS listener configuration needed");
-        info!("  - HTTP/2 protocol negotiation via HTTP/2 connection preface");
-        info!("  - Same proxy service handles both TLS and plain connections");
-
-        // 3. Security considerations
-        info!("Security considerations for plain HTTP/2:");
-        info!("  - No encryption - suitable for internal networks or development");
-        info!("  - No client authentication available");
-        info!("  - Consider using TLS in production environments");
-
-        // 4. Protocol handling
-        info!("Protocol handling:");
-        info!("  - gRPC protocol semantics preserved");
-        info!("  - HTTP trailers forwarded correctly");
-        info!("  - Streaming support maintained");
-        info!("  - Same routing and upstream logic applies");
-
-        Ok(())
+        debug!("Sending streaming request to upstream: {} {}", upstream_req.method(), upstream_req.uri());
+        
+        // Make the request
+        let upstream_response = client.request(upstream_req).await
+            .map_err(|e| {
+                error!("Upstream request failed: {}", e);
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        
+        debug!("Received upstream response: {}", upstream_response.status());
+        
+        // Return the streaming response directly without buffering
+        let (parts, body) = upstream_response.into_parts();
+        
+        // Build response with upstream headers and streaming body
+        let mut response_builder = Response::builder()
+            .status(parts.status)
+            .version(http::Version::HTTP_2);
+        
+        // Copy response headers
+        for (name, value) in parts.headers.iter() {
+            response_builder = response_builder.header(name, value);
+        }
+        
+        // Box the body to match our return type
+        let boxed_body = body
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .boxed();
+        
+        let response = response_builder
+            .body(boxed_body)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        debug!("Forwarding streaming upstream response");
+        Ok(response)
     }
 }

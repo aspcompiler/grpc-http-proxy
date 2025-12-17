@@ -2,8 +2,6 @@
 
 use grpc_http_proxy::config::{ProxyConfig, ServerConfig, TlsConfig, UpstreamConfig};
 use grpc_http_proxy::proxy::ProxyServer;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use tempfile::TempDir;
 use std::fs;
 
@@ -27,7 +25,7 @@ async fn test_tls_integration_no_tls() {
     };
 
     // Create proxy server
-    let server = ProxyServer::new(config).expect("Failed to create proxy server");
+    let _server = ProxyServer::new(config).expect("Failed to create proxy server");
     
     // This should succeed without TLS
     // Note: We don't actually start the server as it would block
