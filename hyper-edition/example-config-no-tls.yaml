@@ -1,0 +1,31 @@
+listen:
+  address: "0.0.0.0"
+  port: 8080
+
+# TLS is disabled - proxy will run in unencrypted mode
+
+routing:
+  rules:
+    - pattern: "/auth.*"
+      upstream:
+        host: "auth-service"
+        port: 9090
+        timeout: 30
+        max_connections: 50
+      priority: 10
+    - pattern: "/user.UserService/*"
+      upstream:
+        host: "user-service"
+        port: 9091
+        timeout: 30
+        max_connections: 100
+      priority: 20
+  
+  catch_all:
+    host: "default-service"
+    port: 9092
+    timeout: 30
+    max_connections: 100
+
+logging:
+  level: "info"

@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Configuration (may contain sensitive data)
+# config.yaml
+
+# Test certificates
+certs/
+*.pem
+*.crt
+*.key
+
+# Temporary files
+*.tmp
+*.temp

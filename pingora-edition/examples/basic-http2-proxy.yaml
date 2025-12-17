@@ -1,0 +1,101 @@
+# Basic HTTP/2 Proxy Configuration
+# This configuration sets up a simple HTTP/2 proxy without TLS encryption.
+# The proxy accepts plain HTTP/2 connections and forwards them to upstream gRPC servers.
+
+# Server configuration
+server:
+  # Address and port to bind the proxy server
+  # The proxy will listen on all interfaces on port 8080
+  bind_address: "0.0.0.0:8080"
+  
+  # Number of worker threads to handle connections
+  # If not specified, defaults to the number of CPU cores
+  # Recommended: 1-2x the number of CPU cores
+  worker_threads: 4
+  
+  # Maximum number of concurrent connections
+  # Helps prevent resource exhaustion under high load
+  # If not specified, uses system defaults
+  max_connections: 1000
+
+# TLS configuration is omitted for plain HTTP/2 operation
+# The proxy will accept plain HTTP/2 connections directly
+# Note: Most gRPC clients require TLS in production environments
+
+# Route configuration
+# Routes allow directing different gRPC services to different upstream servers
+# Routes are matched in order of priority (higher numbers = higher priority)
+# If no priority is specified, routes are matched in configuration order
+routes:
+  # Route for user service APIs
+  - path_pattern: "/user.UserService/*"
+    priority: 10
+    upstream:
+      # Upstream gRPC server address
+      address: "127.0.0.1:9001"
+      
+      # Connection pool size for this upstream
+      # Higher values allow more concurrent requests but use more resources
+      connection_pool_size: 20
+      
+      # Request timeout for this upstream
+      # Requests taking longer than this will be cancelled
+      timeout: "30s"
+      
+      # Optional health check configuration
+      health_check:
+        # Health check endpoint path
+        path: "/grpc.health.v1.Health/Check"
+        
+        # How often to perform health checks
+        interval: "10s"
+        
+        # Timeout for each health check request
+        timeout: "5s"
+  
+  # Route for order service APIs
+  - path_pattern: "/order.OrderService/*"
+    priority: 9
+    upstream:
+      address: "127.0.0.1:9002"
+      connection_pool_size: 15
+      timeout: "45s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "3s"
+  
+  # Route for notification service APIs
+  - path_pattern: "/notification.*"
+    priority: 8
+    upstream:
+      address: "127.0.0.1:9003"
+      connection_pool_size: 10
+      timeout: "20s"
+
+# Default upstream server
+# All requests that don't match any route patterns will be forwarded here
+# This is required and acts as a fallback for unmatched requests
+default_upstream:
+  # Default gRPC server address
+  address: "127.0.0.1:9000"
+  
+  # Larger connection pool for the default upstream
+  # since it may handle various types of requests
+  connection_pool_size: 50
+  
+  # Generous timeout for unknown request types
+  timeout: "60s"
+  
+  # Health check for the default upstream
+  health_check:
+    path: "/grpc.health.v1.Health/Check"
+    interval: "30s"
+    timeout: "10s"
+
+# Usage Notes:
+# 1. Start the proxy: ./grpc-http-proxy --config examples/basic-http2-proxy.yaml
+# 2. gRPC clients should connect using HTTP/2 without TLS (h2c protocol)
+# 3. Example client connection: grpc.Dial("localhost:8080", grpc.WithInsecure())
+# 4. All upstream servers should implement the gRPC Health Checking Protocol
+# 5. Monitor logs for health check failures and connection issues

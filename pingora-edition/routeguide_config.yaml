@@ -1,0 +1,20 @@
+# Example configuration for gRPC HTTP Proxy
+server:
+  bind_address: "127.0.0.1:10001"
+  worker_threads: 4
+  max_connections: 1000
+
+# TLS configuration (optional)
+# tls:
+#   cert_path: "certs/server.crt"
+#   key_path: "certs/server.key"
+#   ca_cert_path: "certs/ca.crt"  # For mTLS
+
+# Route configuration
+routes:
+
+# Default upstream for unmatched routes
+default_upstream:
+  address: "127.0.0.1:10000"
+  connection_pool_size: 20
+  timeout: "60s"

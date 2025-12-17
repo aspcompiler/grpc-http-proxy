@@ -1,0 +1,24 @@
+listen:
+  address: "0.0.0.0"
+  port: 50052
+
+# TLS configuration (optional)
+# Uncomment the following lines to enable TLS:
+# tls:
+#   cert_file: "/path/to/cert.pem"
+#   key_file: "/path/to/key.pem"
+#   # Optional: Enable mutual TLS (client authentication)
+#   # root_ca_file: "/path/to/root-ca.pem"
+
+# For unencrypted mode, simply omit the tls section or set it to null
+
+routing:
+  rules:
+  catch_all:
+    host: "localhost"
+    port: 50051
+    timeout: 30
+    max_connections: 100
+
+logging:
+  level: "info"

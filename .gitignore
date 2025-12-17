@@ -1,0 +1,106 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Rust-specific
+*.pdb
+*.exe
+
+# Debug artifacts
+debug/
+release/
+
+# Backup files
+*.bak
+*.backup
+*.tmp
+
+# Test artifacts
+*.profraw
+*.gcda
+*.gcno
+
+# Environment and configuration files (sensitive)
+.env
+.env.local
+.env.*.local
+
+# Log files
+*.log
+logs/
+
+# Documentation build
+book/
+
+# Flamegraph artifacts
+flamegraph.svg
+perf.data*
+
+# Benchmark results
+criterion/
+benchmarks/
+
+# Coverage reports
+tarpaulin-report.html
+lcov.info
+coverage/
+
+# Local development
+.cargo/
+!.cargo/config.toml
+
+# macOS specific
+.AppleDouble
+.LSOverride
+
+# Windows specific
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+
+# Linux specific
+*~
+
+# JetBrains IDEs
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+
+# Emacs
+\#*\#
+.\#*
+
+# ctags and etags
+TAGS
+tags
+.tags
+.tags1
+tags.lock
+tags.temp

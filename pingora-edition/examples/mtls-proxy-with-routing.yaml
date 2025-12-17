@@ -1,0 +1,323 @@
+# mTLS Proxy with Advanced Routing Configuration
+# This configuration sets up an HTTP/2 proxy with mutual TLS authentication.
+# Both the server and clients must present valid certificates for authentication.
+# The proxy provides sophisticated routing based on gRPC service paths.
+
+# Server configuration
+server:
+  # Address and port to bind the proxy server
+  # Using standard HTTPS port for production mTLS deployment
+  bind_address: "0.0.0.0:443"
+  
+  # Number of worker threads to handle connections
+  # mTLS requires additional CPU for certificate validation
+  worker_threads: 12
+  
+  # Maximum number of concurrent connections
+  # mTLS connections have higher memory overhead
+  max_connections: 1500
+
+# TLS configuration with mutual authentication
+tls:
+  # Server certificate file (PEM format)
+  # This certificate identifies the proxy server to clients
+  # Must be signed by a CA that clients trust
+  cert_path: "certs/server.crt"
+  
+  # Server private key file (PEM format)
+  # Must correspond to the server certificate
+  # Protect with strict file permissions (600)
+  key_path: "certs/server.key"
+  
+  # CA certificate file for client certificate validation
+  # All client certificates must be signed by this CA (or its chain)
+  # This enables mutual TLS authentication
+  ca_cert_path: "certs/ca.crt"
+
+# Advanced route configuration
+# Demonstrates complex routing patterns for enterprise gRPC deployments
+routes:
+  # Critical authentication and authorization services
+  # Highest priority and most restrictive timeouts
+  - path_pattern: "/auth.AuthenticationService/*"
+    priority: 1000
+    upstream:
+      address: "10.0.1.10:9001"
+      connection_pool_size: 50
+      timeout: "10s"  # Fast timeout for auth operations
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "5s"
+        timeout: "2s"
+  
+  - path_pattern: "/auth.AuthorizationService/*"
+    priority: 999
+    upstream:
+      address: "10.0.1.11:9002"
+      connection_pool_size: 40
+      timeout: "8s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "5s"
+        timeout: "2s"
+  
+  # User and profile management services
+  - path_pattern: "/user.UserService/*"
+    priority: 900
+    upstream:
+      address: "10.0.2.10:9010"
+      connection_pool_size: 60
+      timeout: "30s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "10s"
+        timeout: "3s"
+  
+  - path_pattern: "/user.ProfileService/*"
+    priority: 899
+    upstream:
+      address: "10.0.2.11:9011"
+      connection_pool_size: 30
+      timeout: "25s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "4s"
+  
+  # Business logic services
+  - path_pattern: "/inventory.InventoryService/*"
+    priority: 800
+    upstream:
+      address: "10.0.3.10:9020"
+      connection_pool_size: 80
+      timeout: "45s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "20s"
+        timeout: "6s"
+  
+  - path_pattern: "/catalog.ProductService/*"
+    priority: 799
+    upstream:
+      address: "10.0.3.11:9021"
+      connection_pool_size: 70
+      timeout: "35s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "5s"
+  
+  - path_pattern: "/pricing.PricingService/*"
+    priority: 798
+    upstream:
+      address: "10.0.3.12:9022"
+      connection_pool_size: 40
+      timeout: "20s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "10s"
+        timeout: "3s"
+  
+  # Order processing and fulfillment services
+  - path_pattern: "/order.OrderService/*"
+    priority: 700
+    upstream:
+      address: "10.0.4.10:9030"
+      connection_pool_size: 100
+      timeout: "120s"  # Long timeout for complex order processing
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "30s"
+        timeout: "10s"
+  
+  - path_pattern: "/fulfillment.FulfillmentService/*"
+    priority: 699
+    upstream:
+      address: "10.0.4.11:9031"
+      connection_pool_size: 60
+      timeout: "90s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "25s"
+        timeout: "8s"
+  
+  - path_pattern: "/shipping.ShippingService/*"
+    priority: 698
+    upstream:
+      address: "10.0.4.12:9032"
+      connection_pool_size: 50
+      timeout: "60s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "20s"
+        timeout: "7s"
+  
+  # Payment and financial services
+  - path_pattern: "/payment.PaymentService/*"
+    priority: 600
+    upstream:
+      address: "10.0.5.10:9040"
+      connection_pool_size: 80
+      timeout: "75s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "5s"
+  
+  - path_pattern: "/billing.BillingService/*"
+    priority: 599
+    upstream:
+      address: "10.0.5.11:9041"
+      connection_pool_size: 40
+      timeout: "45s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "20s"
+        timeout: "6s"
+  
+  # Notification and communication services
+  - path_pattern: "/notification.NotificationService/*"
+    priority: 500
+    upstream:
+      address: "10.0.6.10:9050"
+      connection_pool_size: 60
+      timeout: "30s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "4s"
+  
+  - path_pattern: "/email.EmailService/*"
+    priority: 499
+    upstream:
+      address: "10.0.6.11:9051"
+      connection_pool_size: 30
+      timeout: "40s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "20s"
+        timeout: "5s"
+  
+  - path_pattern: "/sms.SmsService/*"
+    priority: 498
+    upstream:
+      address: "10.0.6.12:9052"
+      connection_pool_size: 25
+      timeout: "25s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "10s"
+        timeout: "3s"
+  
+  # Analytics and reporting services
+  - path_pattern: "/analytics.AnalyticsService/*"
+    priority: 400
+    upstream:
+      address: "10.0.7.10:9060"
+      connection_pool_size: 40
+      timeout: "180s"  # Long timeout for complex analytics queries
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "60s"
+        timeout: "15s"
+  
+  - path_pattern: "/reporting.ReportService/*"
+    priority: 399
+    upstream:
+      address: "10.0.7.11:9061"
+      connection_pool_size: 30
+      timeout: "300s"  # Very long timeout for report generation
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "120s"
+        timeout: "30s"
+  
+  # API versioning examples
+  - path_pattern: "/api/v2/*"
+    priority: 300
+    upstream:
+      address: "10.0.8.10:9070"
+      connection_pool_size: 50
+      timeout: "60s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "30s"
+        timeout: "10s"
+  
+  - path_pattern: "/api/v1/*"
+    priority: 299
+    upstream:
+      address: "10.0.8.11:9071"
+      connection_pool_size: 40
+      timeout: "45s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "45s"
+        timeout: "12s"
+  
+  # Legacy service support
+  - path_pattern: "/legacy.*"
+    priority: 200
+    upstream:
+      address: "10.0.9.10:9080"
+      connection_pool_size: 20
+      timeout: "120s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "60s"
+        timeout: "20s"
+
+# Default upstream server
+# Handles all unmatched requests and serves as a fallback
+# Should be a robust, general-purpose gRPC server
+default_upstream:
+  address: "10.0.0.100:9000"
+  connection_pool_size: 100
+  timeout: "90s"
+  health_check:
+    path: "/grpc.health.v1.Health/Check"
+    interval: "30s"
+    timeout: "10s"
+
+# mTLS Certificate Setup Instructions:
+#
+# 1. Create a Certificate Authority (CA):
+#    openssl genrsa -out certs/ca.key 4096
+#    openssl req -new -x509 -days 3650 -key certs/ca.key -out certs/ca.crt
+#
+# 2. Generate server private key:
+#    openssl genrsa -out certs/server.key 2048
+#
+# 3. Create server certificate signing request:
+#    openssl req -new -key certs/server.key -out certs/server.csr
+#    (Ensure CN matches your server's domain name)
+#
+# 4. Sign server certificate with CA:
+#    openssl x509 -req -days 365 -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out certs/server.crt
+#
+# 5. Generate client private key:
+#    openssl genrsa -out certs/client.key 2048
+#
+# 6. Create client certificate signing request:
+#    openssl req -new -key certs/client.key -out certs/client.csr
+#
+# 7. Sign client certificate with CA:
+#    openssl x509 -req -days 365 -in certs/client.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out certs/client.crt
+#
+# 8. Set appropriate file permissions:
+#    chmod 600 certs/*.key
+#    chmod 644 certs/*.crt
+
+# Usage Notes:
+# 1. All certificate files must exist and be valid before starting
+# 2. Start the proxy: ./grpc-http-proxy --config examples/mtls-proxy-with-routing.yaml
+# 3. Clients must present valid certificates signed by the CA
+# 4. Example client connection with mTLS:
+#    cert, _ := tls.LoadX509KeyPair("certs/client.crt", "certs/client.key")
+#    creds := credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})
+#    conn, _ := grpc.Dial("localhost:443", grpc.WithTransportCredentials(creds))
+# 5. Monitor certificate expiration for both server and CA certificates
+# 6. Implement certificate rotation procedures for production
+# 7. Consider using certificate revocation lists (CRL) for enhanced security
+# 8. Route priorities ensure predictable request routing in complex scenarios
+# 9. Health checks help maintain service availability and automatic failover

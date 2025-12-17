@@ -1,0 +1,149 @@
+# TLS-Enabled HTTP/2 Proxy Configuration
+# This configuration sets up an HTTP/2 proxy with TLS termination.
+# The proxy accepts TLS-encrypted HTTP/2 connections from clients and forwards
+# them as plain HTTP/2 to upstream gRPC servers.
+
+# Server configuration
+server:
+  # Address and port to bind the proxy server
+  # Standard HTTPS port 443 for production, or 8443 for development
+  bind_address: "0.0.0.0:8443"
+  
+  # Number of worker threads to handle connections
+  # TLS termination is CPU-intensive, so consider more threads
+  worker_threads: 8
+  
+  # Maximum number of concurrent connections
+  # TLS connections use more memory, so adjust accordingly
+  max_connections: 2000
+
+# TLS configuration
+# Enables TLS termination with server certificate authentication
+tls:
+  # Path to the server certificate file (PEM format)
+  # This certificate will be presented to clients during TLS handshake
+  # Must be a valid X.509 certificate, not expired
+  cert_path: "certs/server.crt"
+  
+  # Path to the server private key file (PEM format)
+  # Must correspond to the certificate above
+  # Supports RSA, ECDSA, and Ed25519 keys
+  # Keep this file secure with appropriate file permissions (600)
+  key_path: "certs/server.key"
+  
+  # CA certificate path is omitted for server-only TLS
+  # This means clients are not required to present certificates
+  # ca_cert_path: null
+
+# Route configuration
+# More sophisticated routing for different gRPC services
+routes:
+  # High-priority route for authentication service
+  - path_pattern: "/auth.AuthService/*"
+    priority: 100
+    upstream:
+      address: "127.0.0.1:9001"
+      connection_pool_size: 30
+      timeout: "15s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "5s"
+        timeout: "2s"
+  
+  # Route for user management service
+  - path_pattern: "/user.UserService/*"
+    priority: 90
+    upstream:
+      address: "127.0.0.1:9002"
+      connection_pool_size: 25
+      timeout: "30s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "10s"
+        timeout: "3s"
+  
+  # Route for product catalog service
+  - path_pattern: "/catalog.ProductService/*"
+    priority: 80
+    upstream:
+      address: "127.0.0.1:9003"
+      connection_pool_size: 40
+      timeout: "25s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "15s"
+        timeout: "5s"
+  
+  # Route for order processing service
+  - path_pattern: "/order.OrderService/*"
+    priority: 70
+    upstream:
+      address: "127.0.0.1:9004"
+      connection_pool_size: 35
+      timeout: "60s"  # Longer timeout for complex order processing
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "20s"
+        timeout: "8s"
+  
+  # Route for payment service
+  - path_pattern: "/payment.PaymentService/*"
+    priority: 60
+    upstream:
+      address: "127.0.0.1:9005"
+      connection_pool_size: 20
+      timeout: "45s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "10s"
+        timeout: "4s"
+  
+  # Catch-all route for API v1 services
+  - path_pattern: "/api/v1/*"
+    priority: 50
+    upstream:
+      address: "127.0.0.1:9010"
+      connection_pool_size: 25
+      timeout: "40s"
+      health_check:
+        path: "/grpc.health.v1.Health/Check"
+        interval: "30s"
+        timeout: "10s"
+
+# Default upstream server
+# Handles all unmatched requests and serves as a fallback
+default_upstream:
+  address: "127.0.0.1:9000"
+  connection_pool_size: 60
+  timeout: "90s"
+  health_check:
+    path: "/grpc.health.v1.Health/Check"
+    interval: "60s"
+    timeout: "15s"
+
+# Certificate Generation Instructions:
+# 
+# 1. Generate a private key:
+#    openssl genrsa -out certs/server.key 2048
+#
+# 2. Create a certificate signing request:
+#    openssl req -new -key certs/server.key -out certs/server.csr
+#    (Fill in appropriate details, ensure CN matches your domain)
+#
+# 3. Generate a self-signed certificate (for development):
+#    openssl x509 -req -days 365 -in certs/server.csr -signkey certs/server.key -out certs/server.crt
+#
+# 4. For production, use a certificate from a trusted CA instead of self-signed
+#
+# 5. Set appropriate file permissions:
+#    chmod 600 certs/server.key
+#    chmod 644 certs/server.crt
+
+# Usage Notes:
+# 1. Ensure certificate files exist and are valid before starting
+# 2. Start the proxy: ./grpc-http-proxy --config examples/tls-enabled-proxy.yaml
+# 3. gRPC clients should connect using TLS: grpc.Dial("localhost:8443", grpc.WithTransportCredentials(...))
+# 4. The proxy automatically negotiates HTTP/2 via ALPN with "h2" identifier
+# 5. All communication between proxy and upstream servers is plain HTTP/2
+# 6. Monitor certificate expiration and renew before expiry
+# 7. Consider using certificate rotation for production deployments
