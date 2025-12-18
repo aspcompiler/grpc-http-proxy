@@ -111,11 +111,27 @@ impl ProxyServer {
 
         // Create a hyper service wrapper
         let hyper_service = HyperServiceWrapper {
-            proxy_service: service,
+            proxy_service: service.clone(),
             client_addr,
             server_addr,
         };
 
+        // Check if TLS is enabled and handle accordingly
+        if service.is_tls_enabled() {
+            debug!("TLS enabled - performing TLS handshake for {}", client_addr);
+            Self::handle_tls_connection(stream, client_addr, hyper_service, service).await
+        } else {
+            debug!("TLS disabled - serving plain HTTP/2 for {}", client_addr);
+            Self::handle_plain_connection(stream, client_addr, hyper_service).await
+        }
+    }
+
+    /// Handle a plain HTTP/2 connection (no TLS)
+    async fn handle_plain_connection(
+        stream: tokio::net::TcpStream,
+        client_addr: SocketAddr,
+        hyper_service: HyperServiceWrapper,
+    ) -> Result<()> {
         // Use HTTP/2 to serve the connection with gRPC-optimized settings
         let io = TokioIo::new(stream);
         
@@ -138,7 +154,61 @@ impl ProxyServer {
             error!("HTTP/2 connection error from {}: {}", client_addr, e);
         }
 
-        debug!("Connection from {} closed", client_addr);
+        debug!("Plain connection from {} closed", client_addr);
+        Ok(())
+    }
+
+    /// Handle a TLS connection with HTTP/2
+    async fn handle_tls_connection(
+        stream: tokio::net::TcpStream,
+        client_addr: SocketAddr,
+        hyper_service: HyperServiceWrapper,
+        service: Arc<GrpcProxyService>,
+    ) -> Result<()> {
+        use tokio_rustls::TlsAcceptor;
+        
+        // Get TLS configuration
+        let tls_config = service.tls_config()
+            .ok_or_else(|| anyhow!("TLS configuration not available"))?;
+        
+        let acceptor = TlsAcceptor::from(tls_config);
+        
+        // Perform TLS handshake
+        debug!("Starting TLS handshake with {}", client_addr);
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(stream) => {
+                debug!("TLS handshake successful with {}", client_addr);
+                stream
+            }
+            Err(e) => {
+                error!("TLS handshake failed with {}: {}", client_addr, e);
+                return Err(anyhow!("TLS handshake failed: {}", e));
+            }
+        };
+
+        // Wrap the TLS stream for hyper
+        let io = TokioIo::new(tls_stream);
+        
+        let mut builder = http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        
+        // Configure HTTP/2 settings for gRPC over TLS
+        builder
+            .initial_stream_window_size(Some(65536))  // 64KB initial window
+            .initial_connection_window_size(Some(1048576))  // 1MB connection window
+            .max_frame_size(Some(16384))  // 16KB max frame size
+            .max_concurrent_streams(Some(100))  // Allow up to 100 concurrent streams
+            .keep_alive_interval(Some(std::time::Duration::from_secs(30)))  // Keep alive every 30s
+            .keep_alive_timeout(std::time::Duration::from_secs(10))  // 10s keep alive timeout
+            .timer(hyper_util::rt::TokioTimer::new());  // Add timer for hyper
+        
+        if let Err(e) = builder
+            .serve_connection(io, hyper_service)
+            .await
+        {
+            error!("HTTP/2 over TLS connection error from {}: {}", client_addr, e);
+        }
+
+        debug!("TLS connection from {} closed", client_addr);
         Ok(())
     }
 
